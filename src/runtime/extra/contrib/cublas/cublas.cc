@@ -27,6 +27,9 @@
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 
+#include <atomic>
+#include <cstdlib>
+
 #include "../../../../../3rdparty/compiler-rt/builtin_fp16.h"
 #include "../cblas/gemm_common.h"
 #include "cublas_utils.h"
@@ -136,6 +139,27 @@ bool CheckMixPrecisionType(DLDataType in_dtype, DLDataType out_dtype, bool int_s
 
 int roundoff(int v, int d) { return (v + d - 1) / d * d; }
 
+// Process-global switch allowing fp32 GEMMs to run on TF32 tensor cores
+// (~10-bit mantissa), mirroring torch.backends.cuda.matmul.allow_tf32.
+// Seeded once from the TVM_CUBLAS_ALLOW_TF32 env var; toggled at runtime via
+// the tvm.contrib.cublas.set_allow_tf32 global function.
+std::atomic<bool>& AllowTf32Flag() {
+  static std::atomic<bool> flag([]() {
+    const char* env = std::getenv("TVM_CUBLAS_ALLOW_TF32");
+    return env != nullptr && std::string(env) == "1";
+  }());
+  return flag;
+}
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef()
+      .def("tvm.contrib.cublas.set_allow_tf32",
+           [](bool value) { AllowTf32Flag().store(value, std::memory_order_relaxed); })
+      .def("tvm.contrib.cublas.get_allow_tf32",
+           []() -> bool { return AllowTf32Flag().load(std::memory_order_relaxed); });
+}
+
 #if CUDART_VERSION >= 10010
 
 void CallCublasLt(cublasLtHandle_t hdl, cudaStream_t stream,
@@ -188,6 +212,11 @@ void CallCublasLt(cublasLtHandle_t hdl, cudaStream_t stream,
     scale_type = CUDA_R_32I;
     alpha = &one_i32;
     beta = &zero_i32;
+  }
+
+  if (ab_type == CUDA_R_32F && compute_type == CUBLAS_COMPUTE_32F &&
+      AllowTf32Flag().load(std::memory_order_relaxed)) {
+    compute_type = CUBLAS_COMPUTE_32F_FAST_TF32;
   }
 
   cublasLtMatmulDesc_t op_desc;

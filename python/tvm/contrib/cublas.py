@@ -20,6 +20,27 @@ import tvm
 from tvm import te
 
 
+def set_allow_tf32(value):
+    """Allow fp32 cuBLAS(Lt) GEMMs to use TF32 tensor cores (~10-bit mantissa).
+
+    Mirrors torch.backends.cuda.matmul.allow_tf32. The initial default comes
+    from the TVM_CUBLAS_ALLOW_TF32 environment variable ("1" enables). Takes
+    effect on subsequent GEMM calls; already-captured CUDA graphs keep the
+    compute type they were captured with.
+
+    Parameters
+    ----------
+    value : bool
+        Whether TF32 is allowed for fp32 GEMMs.
+    """
+    tvm.get_global_func("tvm.contrib.cublas.set_allow_tf32")(bool(value))
+
+
+def get_allow_tf32():
+    """Return whether fp32 cuBLAS(Lt) GEMMs may use TF32 tensor cores."""
+    return bool(tvm.get_global_func("tvm.contrib.cublas.get_allow_tf32")())
+
+
 def matmul(lhs, rhs, transa=False, transb=False, dtype=None):
     """Create an extern op that compute matrix mult of A and rhs with cuBLAS
 
