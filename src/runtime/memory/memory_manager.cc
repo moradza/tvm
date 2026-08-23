@@ -270,7 +270,18 @@ void Allocator::Clear() {
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("vm.builtin.memory_manager.clear", MemoryManager::Clear);
+  refl::GlobalDef()
+      .def("vm.builtin.memory_manager.clear", MemoryManager::Clear)
+      // Explicit pool pre-stocking (Python: tvm.runtime.pool_prewarm).
+      // Needed before CUDA-graph capture, where fresh cudaMalloc is illegal.
+      .def("vm.builtin.memory_manager.pool_prewarm",
+           [](DLDevice dev, int64_t nbytes, int64_t count) {
+             auto* alloc = MemoryManager::GetOrCreateAllocator(dev, AllocatorType::kPooled);
+             auto* pooled = dynamic_cast<PooledAllocator*>(alloc);
+             TVM_FFI_ICHECK(pooled != nullptr)
+                 << "pool_prewarm: the allocator for the device is not a PooledAllocator";
+             pooled->Prewarm(dev, static_cast<size_t>(nbytes), static_cast<int>(count));
+           });
 }
 
 }  // namespace memory

@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <numeric>
+#include <atomic>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -43,6 +44,24 @@
 namespace tvm {
 namespace runtime {
 namespace vm {
+
+/*!
+ * \brief Process-wide pinned-aux configuration for whole-step CUDA graph
+ * capture of decode. Set via the explicit FFI API
+ * `vm.builtin.paged_attention_kv_cache_set_pinned_aux(enable, slot_elems)`
+ * (Python: tvm.runtime.set_kv_cache_pinned_aux) BEFORE the KV cache is
+ * created — each cache captures the values at construction. Not an env var
+ * by design: configuration is an API call, seeded from nothing.
+ */
+struct PinnedAuxConfig {
+  std::atomic<bool> enabled{false};
+  std::atomic<int64_t> slot_elems{4096};
+  static PinnedAuxConfig* Global() {
+    static PinnedAuxConfig inst;
+    return &inst;
+  }
+};
+
 
 //-------------------------------------------
 // We keep the implementation private as
@@ -283,6 +302,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   TVMStreamHandle compute_stream_ = nullptr;
   /*! \brief The device stream for copying auxiliary data structure to GPU. */
   TVMStreamHandle copy_stream_ = nullptr;
+  /*! \brief Pinned-aux (CUDA-graph capture) mode, captured at construction. */
+  bool pinned_aux_mode_ = false;
   /*! \brief The device stream for KV transfer */
   TVMStreamHandle kv_transfer_stream_ = nullptr;
 
@@ -529,11 +550,18 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     // Create the auxiliary data manager for attention.
     // We only use the merged aux data for CUDA, since direct pointer
     // operations may have issues on other platforms.
+    // Pinned-aux (CUDA-graph) mode: run aux uploads on the COMPUTE stream.
+    // Replayed graphs cannot wait on per-step copy-stream events (the event
+    // dependency is frozen at capture time), so cross-stream uploads race
+    // the replayed kernels. Same-stream uploads are ordered by construction.
+    pinned_aux_mode_ = PinnedAuxConfig::Global()->enabled.load(std::memory_order_relaxed);
+    TVMStreamHandle aux_stream = pinned_aux_mode_ ? compute_stream_ : copy_stream_;
     if (device_.device_type == DLDeviceType::kDLCUDA ||
         device_.device_type == DLDeviceType::kDLCPU) {
       aux_data_manager_ = std::make_unique<CachedPagedKVCacheAuxDataManager>(
           reserved_num_seqs, num_total_pages, prefill_chunk_size, dtype_aux_, device,
-          preferred_host_device, copy_stream_);
+          preferred_host_device, aux_stream, pinned_aux_mode_,
+          PinnedAuxConfig::Global()->slot_elems.load(std::memory_order_relaxed));
     } else {
       aux_data_manager_ = std::make_unique<PlainPagedKVCacheAuxDataManager>(
           reserved_num_seqs, num_total_pages, prefill_chunk_size, dtype_aux_, device,
@@ -1209,6 +1237,12 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
         sequences[i]->kv_transfer_metadata.local_position_map.clear();
       }
     }
+
+    // Eagerly sync aux arrays and run attention-kernel planning here (host
+    // side, outside any CUDA-graph capture of the forward function), instead
+    // of lazily inside the first attention op. This keeps the forward pass
+    // pure kernel-enqueue so the whole step can be stream-captured.
+    ComputeStreamWaitForCopyStream();
   }
 
   void EndForward() final {
@@ -2347,7 +2381,10 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     // the plan so its workspace writes happen on the copy stream -- matching the
     // aux-array copies above and the copy->compute synchronization below (this
     // preserves the prior behavior where copy_stream_ was passed explicitly).
-    bool plan_on_copy_stream = copy_stream_ != nullptr && copy_stream_ != compute_stream_;
+    // In pinned (CUDA-graph) mode the plan's workspace writes must be
+    // stream-ordered with replayed kernels: keep them on the compute stream.
+    bool plan_on_copy_stream =
+        !pinned_aux_mode_ && copy_stream_ != nullptr && copy_stream_ != compute_stream_;
     if (plan_on_copy_stream) {
       DeviceAPI::Get(device_)->SetStream(device_, copy_stream_);
     }
@@ -2531,6 +2568,16 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef()
+      .def("vm.builtin.paged_attention_kv_cache_set_pinned_aux",
+           [](bool enable, int64_t slot_elems) {
+             PinnedAuxConfig::Global()->enabled.store(enable, std::memory_order_relaxed);
+             if (slot_elems > 0) {
+               PinnedAuxConfig::Global()->slot_elems.store(slot_elems, std::memory_order_relaxed);
+             }
+           })
+      .def("vm.builtin.paged_attention_kv_cache_get_pinned_aux",
+           []() { return PinnedAuxConfig::Global()->enabled.load(std::memory_order_relaxed); });
   refl::GlobalDef().def_packed(
       "vm.builtin.paged_attention_kv_cache_create", [](ffi::PackedArgs args, ffi::Any* rv) {
         // Todo: cuda graph arg

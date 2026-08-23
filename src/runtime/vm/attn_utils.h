@@ -814,15 +814,19 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
   explicit CachedPagedKVCacheAuxDataManager(int64_t reserved_num_seqs, int64_t num_total_pages,
                                             int64_t prefill_chunk_size, DLDataType dtype_aux,
                                             Device device, Device preferred_host_device,
-                                            TVMStreamHandle copy_stream)
+                                            TVMStreamHandle copy_stream, bool pinned_aux = false,
+                                            int64_t pinned_slot_elems = 4096)
       : PagedKVCacheAuxDataManager(dtype_aux, device, preferred_host_device, copy_stream),
         elem_byte_size_((dtype_aux.bits * dtype_aux.lanes + 7) / 8),
-        offset_alignment_(cuda_byte_alignment_ / elem_byte_size_) {
+        offset_alignment_(cuda_byte_alignment_ / elem_byte_size_),
+        pinned_(pinned_aux),
+        pinned_slot_elems_(pinned_slot_elems) {
     // - Calculate cache size of all the attention auxiliary arrays in
     // local cache and the large on-device array.
     // int64_t attn_aux_data_cache_size =
     //     CalculateAttnAuxDataCacheSize(reserved_num_seqs, num_total_pages, prefill_chunk_size);
     int64_t attn_aux_data_cache_size = 32 * 1024 * 1024;
+    attn_aux_arena_elems_ = attn_aux_data_cache_size;
     // - Initialize the host auxiliary data buffer.
     merged_attn_aux_data_host_ =
         HostMemoryVector(attn_aux_data_cache_size, dtype_aux, preferred_host_device);
@@ -842,70 +846,79 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
 
   void ResetAttnAuxDataCopy() final { attn_aux_data_copy_offset_ = 0; }
   Tensor CopyQOIndptrOnDepthAsync(HostMemoryVector* data, int depth) final {
-    return CopyAttnAuxVecToCache(data);
+    return CopyAttnAuxVecToCache(data, "CopyQOIndptrOnDepthAsync", depth);
   }
   Tensor CopyPageIndptrOnDepthAsync(HostMemoryVector* data, int depth) final {
-    return CopyAttnAuxVecToCache(data);
+    return CopyAttnAuxVecToCache(data, "CopyPageIndptrOnDepthAsync", depth);
   }
   Tensor CopyPageIndicesOnDepthAsync(HostMemoryVector* data, int depth) final {
-    return CopyAttnAuxVecToCache(data);
+    return CopyAttnAuxVecToCache(data, "CopyPageIndicesOnDepthAsync", depth);
   }
   Tensor CopyLastPageLenOnDepthAsync(HostMemoryVector* data, int depth) final {
-    return CopyAttnAuxVecToCache(data);
+    return CopyAttnAuxVecToCache(data, "CopyLastPageLenOnDepthAsync", depth);
   }
   Tensor CopyKRoPEPosOffsetOnDepthAsync(HostMemoryVector* data, int depth) final {
-    return CopyAttnAuxVecToCache(data);
+    return CopyAttnAuxVecToCache(data, "CopyKRoPEPosOffsetOnDepthAsync", depth);
   }
   Tensor CopyCurAppendLengthIndptrAsync(HostMemoryVector* data) final {
-    return CopyAttnAuxVecToCache(data);
+    return CopyAttnAuxVecToCache(data, "CopyCurAppendLengthIndptrAsync", 0);
   }
   Tensor CopyKRaggedRoPEPosOffsetAsync(HostMemoryVector* data) final {
-    return CopyAttnAuxVecToCache(data);
+    return CopyAttnAuxVecToCache(data, "CopyKRaggedRoPEPosOffsetAsync", 0);
   }
-  Tensor CopyQRoPEPosMapAsync(HostMemoryVector* data) final { return CopyAttnAuxVecToCache(data); }
+  Tensor CopyQRoPEPosMapAsync(HostMemoryVector* data) final { return CopyAttnAuxVecToCache(data, "CopyQRoPEPosMapAsync", 0); }
   Tensor CopyAppendPositionMapAsync(HostMemoryVector* data) final {
-    return CopyAttnAuxVecToCache(data);
+    return CopyAttnAuxVecToCache(data, "CopyAppendPositionMapAsync", 0);
   }
   Tensor CopyKVTransferRemotePositionMapAsync(HostMemoryVector* data) final {
-    return CopyAttnAuxVecToCache(data);
+    return CopyAttnAuxVecToCache(data, "CopyKVTransferRemotePositionMapAsync", 0);
   }
   Tensor CopyKVTransferRecverIDAsync(HostMemoryVector* data) final {
-    return CopyAttnAuxVecToCache(data);
+    return CopyAttnAuxVecToCache(data, "CopyKVTransferRecverIDAsync", 0);
   }
   Tensor CopyKVTransferPage2PageLocalPositionMapAsync(HostMemoryVector* data) final {
-    return CopyAttnAuxVecToCache(data);
+    return CopyAttnAuxVecToCache(data, "CopyKVTransferPage2PageLocalPositionMapAsync", 0);
   }
   Tensor CopyKVTransferPage2PageRemotePositionMapAsync(HostMemoryVector* data) final {
-    return CopyAttnAuxVecToCache(data);
+    return CopyAttnAuxVecToCache(data, "CopyKVTransferPage2PageRemotePositionMapAsync", 0);
   }
   Tensor CopyKVTransferPage2PageRecverIDAsync(HostMemoryVector* data) final {
-    return CopyAttnAuxVecToCache(data);
+    return CopyAttnAuxVecToCache(data, "CopyKVTransferPage2PageRecverIDAsync", 0);
   }
   Tensor CopyTreeAttnMaskOnDepthAsync(HostMemoryVector* data, int depth) final {
-    Tensor mask_1d = CopyAttnAuxVecToCache(data);
+    Tensor mask_1d = CopyAttnAuxVecToCache(data, "CopyTreeAttnMaskOnDepthAsync", depth);
     return mask_1d.CreateView({static_cast<int64_t>(data->size() / 2), 2}, mask_1d->dtype);
   }
   Tensor CopyTreeAttnMNIndptrOnDepthAsync(HostMemoryVector* data, int depth) final {
-    return CopyAttnAuxVecToCache(data);
+    return CopyAttnAuxVecToCache(data, "CopyTreeAttnMNIndptrOnDepthAsync", depth);
   }
   Tensor CopyLengthInfoOnDepthAsync(HostMemoryVector* last_page_len,
                                     HostMemoryVector* sliding_window_offset,
                                     HostMemoryVector* sink_size, int depth) final {
     int64_t n_elem = last_page_len->size();
-    std::memcpy(merged_attn_aux_data_host_.data() + attn_aux_data_copy_offset_,
-                last_page_len->data(), n_elem * elem_byte_size_);
-    std::memcpy(merged_attn_aux_data_host_.data() + attn_aux_data_copy_offset_ + n_elem,
-                sliding_window_offset->data(), n_elem * elem_byte_size_);
-    std::memcpy(merged_attn_aux_data_host_.data() + attn_aux_data_copy_offset_ + 2 * n_elem,
-                sink_size->data(), n_elem * elem_byte_size_);
-    Tensor view = merged_attn_aux_data_device_.CreateView(
-        {3, n_elem}, dtype_aux_, attn_aux_data_copy_offset_ * elem_byte_size_);
-    attn_aux_data_copy_offset_ += CeilDivElemAlignment(3 * n_elem);
+    int64_t offset = attn_aux_data_copy_offset_;
+    if (pinned_) {
+      offset = PinnedOffsetFor(std::string("CopyLengthInfoOnDepthAsync/") + std::to_string(depth),
+                               3 * n_elem);
+    }
+    std::memcpy(merged_attn_aux_data_host_.data() + offset, last_page_len->data(),
+                n_elem * elem_byte_size_);
+    std::memcpy(merged_attn_aux_data_host_.data() + offset + n_elem, sliding_window_offset->data(),
+                n_elem * elem_byte_size_);
+    std::memcpy(merged_attn_aux_data_host_.data() + offset + 2 * n_elem, sink_size->data(),
+                n_elem * elem_byte_size_);
+    Tensor view =
+        merged_attn_aux_data_device_.CreateView({3, n_elem}, dtype_aux_, offset * elem_byte_size_);
+    if (!pinned_) {
+      attn_aux_data_copy_offset_ += CeilDivElemAlignment(3 * n_elem);
+    }
     return view;
   }
 
   void CommitAttnAuxDataCopy() final {
-    std::vector<int64_t> copy_shape{attn_aux_data_copy_offset_};
+    std::vector<int64_t> copy_shape{
+        pinned_ ? std::max(pinned_high_water_, attn_aux_data_copy_offset_)
+                : attn_aux_data_copy_offset_};
     DLTensor copy_dst;
     copy_dst.data = merged_attn_aux_data_device_->data;
     copy_dst.device = device_;
@@ -1024,13 +1037,43 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
    * \brief Copy the input data to the cache at the given offset.
    * And return the Tensor view of the cache starting at the offset.
    */
-  Tensor CopyAttnAuxVecToCache(HostMemoryVector* data) {
+  // Pinned-aux mode: every aux array KIND gets a fixed slot in the arena,
+  // so its device address never changes across steps. Required for replaying
+  // a CUDA-graph-captured forward pass: recorded kernels read aux arrays at
+  // capture-time addresses, and the default bump-packing reshuffles offsets
+  // whenever per-step array sets/sizes change (which silently corrupts KV
+  // appends under replay). Enabled via the explicit
+  // vm.builtin.kv_state_set_pinned_aux API (not an env var).
+  int64_t PinnedOffsetFor(const std::string& key, int64_t n_elem) {
+    auto it = pinned_slots_.find(key);
+    if (it == pinned_slots_.end()) {
+      // Slot capacity: the larger of the configured default and the first
+      // request. First use happens at prefill, which has the largest sizes,
+      // so later (decode) requests fit. The check below guards the assumption.
+      int64_t cap = std::max<int64_t>(pinned_slot_elems_, CeilDivElemAlignment(n_elem));
+      it = pinned_slots_.emplace(key, PinnedSlot{pinned_high_water_, cap}).first;
+      pinned_high_water_ += cap;
+      TVM_FFI_ICHECK_LE(pinned_high_water_, attn_aux_arena_elems_) << "Pinned aux arena overflow";
+    }
+    TVM_FFI_ICHECK_LE(n_elem, it->second.cap)
+        << "Aux array exceeds its pinned slot capacity (first use was smaller; raise the "
+        << "slot_elems argument of vm.builtin.kv_state_set_pinned_aux): " << key;
+    return it->second.offset;
+  }
+
+  Tensor CopyAttnAuxVecToCache(HostMemoryVector* data, const char* key = nullptr, int depth = 0) {
     int64_t n_elem = data->size();
-    std::memcpy(merged_attn_aux_data_host_.data() + attn_aux_data_copy_offset_, data->data(),
+    int64_t offset = attn_aux_data_copy_offset_;
+    if (pinned_ && key != nullptr) {
+      offset = PinnedOffsetFor(std::string(key) + "/" + std::to_string(depth), n_elem);
+    }
+    std::memcpy(merged_attn_aux_data_host_.data() + offset, data->data(),
                 n_elem * elem_byte_size_);
-    Tensor view = merged_attn_aux_data_device_.CreateView(
-        {n_elem}, dtype_aux_, attn_aux_data_copy_offset_ * elem_byte_size_);
-    attn_aux_data_copy_offset_ += CeilDivElemAlignment(n_elem);
+    Tensor view =
+        merged_attn_aux_data_device_.CreateView({n_elem}, dtype_aux_, offset * elem_byte_size_);
+    if (!(pinned_ && key != nullptr)) {
+      attn_aux_data_copy_offset_ += CeilDivElemAlignment(n_elem);
+    }
     return view;
   }
 
@@ -1054,6 +1097,20 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
   const int64_t offset_alignment_;
 
   int64_t attn_aux_data_copy_offset_ = 0;
+  // Pinned-aux mode state (see PinnedOffsetFor). pinned_slot_elems_ is the
+  // per-slot capacity: every pinned slot is uploaded every step (the commit
+  // copies the whole pinned extent), so slots must stay SMALL — with ~30
+  // slots, 4096 elems x 4B = ~0.5 MB/step. Very large caches (page_indices
+  // needs >= total page count) pass a larger slot_elems to the setter API.
+  const bool pinned_ = false;
+  const int64_t pinned_slot_elems_ = 4096;
+  struct PinnedSlot {
+    int64_t offset;
+    int64_t cap;
+  };
+  std::unordered_map<std::string, PinnedSlot> pinned_slots_;
+  int64_t pinned_high_water_ = 0;
+  int64_t attn_aux_arena_elems_ = 0;
   int64_t compact_kv_aux_data_copy_offset_ = 0;
   HostMemoryVector merged_attn_aux_data_host_;
   HostMemoryVector merged_compact_kv_aux_data_host_;

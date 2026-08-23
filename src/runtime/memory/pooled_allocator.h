@@ -46,6 +46,30 @@ class PooledAllocator : public Allocator {
 
   ~PooledAllocator() { ReleaseAll(); }
 
+  /*!
+   * \brief Pre-stock `count` pool entries of (page-rounded) `nbytes` each.
+   *
+   * Steady-state allocations of that size then hit the pool instead of
+   * cudaMalloc. Required when a forward pass runs under CUDA stream
+   * capture, where a fresh cudaMalloc is illegal. Exposed to Python as
+   * `runtime.memory.pool_prewarm` — an explicit API, not an env toggle.
+   */
+  void Prewarm(Device dev, size_t nbytes, int count) {
+    std::lock_guard<std::recursive_mutex> lock(mu_);
+    size_t size = ((nbytes + page_size_ - 1) / page_size_) * page_size_;
+    DLDataType type_hint{kDLUInt, 8, 1};
+    for (int i = 0; i < count; ++i) {
+      Buffer buf;
+      buf.device = dev;
+      buf.size = size;
+      buf.alloc_type = kPooled;
+      buf.data = DeviceAllocDataSpace(dev, size, kAllocAlignment, type_hint);
+      used_memory_.fetch_add(size, std::memory_order_relaxed);
+      memory_pool_[size].push_back(buf);
+    }
+    LOG(INFO) << "[pool] prewarmed " << count << " x " << size << " B";
+  }
+
   Buffer Alloc(Device dev, size_t nbytes, size_t alignment, DLDataType type_hint) override {
     std::lock_guard<std::recursive_mutex> lock(mu_);
     size_t size = ((nbytes + page_size_ - 1) / page_size_) * page_size_;
@@ -63,7 +87,8 @@ class PooledAllocator : public Allocator {
     try {
       buf.data = DeviceAllocDataSpace(dev, size, alignment, type_hint);
     } catch (tvm::ffi::Error& err) {
-      LOG(WARNING) << "PooledAllocator got InternalError during allocation: " << err.what();
+      LOG(WARNING) << "PooledAllocator got InternalError during allocation of " << size
+                   << " bytes (pool bucket miss): " << err.what();
       LOG(WARNING) << "Trying to release all unused memory and reallocate...";
       ReleaseAll();
       buf.data = DeviceAllocDataSpace(dev, size, alignment, type_hint);
