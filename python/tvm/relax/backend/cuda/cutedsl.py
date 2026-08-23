@@ -90,11 +90,25 @@ def _gemm_spec_or_none(n, k, in_dtype, out_dtype, epilogue):
 #: (prefill) are always claimed, matching the old campaign's
 #: symbolic-M-first routing. `shapes`, when set, restricts dispatch to those
 #: (n, k) weight shapes.
-_POLICY = {"min_static_m": 1024, "shapes": None}
+#: Per-(n, k) kernel specialization (tile / cluster / swizzle) — where the
+#: persistent GEMM's performance lives. Defaults are the H100
+#: bench_persistent_sweep winners from the TinyLlama campaign; anything not
+#: listed builds with GemmSpec defaults (tile (128,128), cluster (1,1),
+#: swizzle 1), which is CORRECT but typically ~15-20% off tuned.
+_DEFAULT_SPECIALIZATIONS = {
+    (11264, 2048): {"tile": [128, 256], "cluster": [2, 2], "swizzle": 8},
+    (2048, 5632): {"tile": [128, 256], "cluster": [2, 1], "swizzle": 1},
+    (2560, 2048): {"tile": [128, 256], "cluster": [2, 1], "swizzle": 1},
+    (2048, 2048): {"tile": [128, 256], "cluster": [2, 1], "swizzle": 1},
+}
+
+_POLICY = {"min_static_m": 1024, "shapes": None,
+           "specializations": dict(_DEFAULT_SPECIALIZATIONS)}
 
 
-def set_dispatch_policy(min_static_m: int = None, shapes=None):
-    """Configure which matmul call-sites the cutedsl patterns claim.
+def set_dispatch_policy(min_static_m: int = None, shapes=None, specializations=None):
+    """Configure which matmul call-sites the cutedsl patterns claim and how
+    the kernels are specialized.
 
     Parameters
     ----------
@@ -103,10 +117,17 @@ def set_dispatch_policy(min_static_m: int = None, shapes=None):
         Symbolic-M sites are always eligible.
     shapes : iterable of (n, k), optional
         If given, only these weight shapes are claimed; None = all feasible.
+    specializations : dict, optional
+        {(n, k): {"tile": [m, n], "cluster": [x, y], "swizzle": int}}
+        MERGED over the built-in sweep-winner defaults.
     """
     if min_static_m is not None:
         _POLICY["min_static_m"] = int(min_static_m)
     _POLICY["shapes"] = None if shapes is None else {tuple(map(int, s)) for s in shapes}
+    if specializations is not None:
+        merged = dict(_DEFAULT_SPECIALIZATIONS)
+        merged.update({tuple(map(int, k)): dict(v) for k, v in specializations.items()})
+        _POLICY["specializations"] = merged
 
 
 def _check_matmul(context: PatternCheckContext) -> bool:
@@ -226,6 +247,8 @@ def _parse_codegen_function(fn) -> dict:
         "x_param": x_param,
         "w_param": w_param,
         "x_ndim": int(fn.params[x_param].ty.ndim),
+        # per-shape tile/cluster/swizzle from the policy table (may be {})
+        **_POLICY["specializations"].get((int(w_ty.shape[0]), int(w_ty.shape[1])), {}),
     }
 
 
