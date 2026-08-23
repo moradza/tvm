@@ -83,6 +83,32 @@ def _gemm_spec_or_none(n, k, in_dtype, out_dtype, epilogue):
         return None
 
 
+#: Dispatch policy, set via :func:`set_dispatch_policy` (explicit API — the
+#: pattern checks have no other config channel). A fully-STATIC-M call-site
+#: is claimed only when M >= min_static_m: the persistent GEMM wins at large
+#: M and loses badly at decode-sized M (M = batch), while symbolic-M sites
+#: (prefill) are always claimed, matching the old campaign's
+#: symbolic-M-first routing. `shapes`, when set, restricts dispatch to those
+#: (n, k) weight shapes.
+_POLICY = {"min_static_m": 1024, "shapes": None}
+
+
+def set_dispatch_policy(min_static_m: int = None, shapes=None):
+    """Configure which matmul call-sites the cutedsl patterns claim.
+
+    Parameters
+    ----------
+    min_static_m : int, optional
+        Minimum M (product of lhs lead dims) for fully-static call-sites.
+        Symbolic-M sites are always eligible.
+    shapes : iterable of (n, k), optional
+        If given, only these weight shapes are claimed; None = all feasible.
+    """
+    if min_static_m is not None:
+        _POLICY["min_static_m"] = int(min_static_m)
+    _POLICY["shapes"] = None if shapes is None else {tuple(map(int, s)) for s in shapes}
+
+
 def _check_matmul(context: PatternCheckContext) -> bool:
     """Predicate for cutedsl.matmul_transposed[_relu]."""
     if has_leaking_intermediate_variables(context):
@@ -93,13 +119,23 @@ def _check_matmul(context: PatternCheckContext) -> bool:
 
     if lhs.ty is None or rhs.ty is None:
         return False
-    # v1 BYOC contract: plain 2D x (M,K) and 2D weight (N,K); rank-3 lhs
-    # (prefill-style) needs a rank-specific wrapper — future entry.
-    if lhs.ty.ndim != 2 or rhs.ty.ndim != 2:
+    # x is (M, K) or row-major (B, S, K) (flattened to M = B*S inside the
+    # kernel wrapper); weight is 2D (N, K).
+    if lhs.ty.ndim not in (2, 3) or rhs.ty.ndim != 2:
         return False
     n, k = _static_int(rhs.ty.shape[0]), _static_int(rhs.ty.shape[1])
     if n is None or k is None or _static_int(lhs.ty.shape[-1]) != k:
         return False
+    if _POLICY["shapes"] is not None and (n, k) not in _POLICY["shapes"]:
+        return False
+    # static-M threshold (symbolic lead dims -> always eligible)
+    lead = [_static_int(d) for d in list(lhs.ty.shape)[:-1]]
+    if all(d is not None for d in lead):
+        m = 1
+        for d in lead:
+            m *= d
+        if m < _POLICY["min_static_m"]:
+            return False
 
     # permute_dims must be a real transpose (identity-permute hole on
     # square weights): the matched rhs var binds to the permute call
@@ -189,6 +225,7 @@ def _parse_codegen_function(fn) -> dict:
         "epilogue": epilogue,
         "x_param": x_param,
         "w_param": w_param,
+        "x_ndim": int(fn.params[x_param].ty.ndim),
     }
 
 

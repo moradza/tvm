@@ -84,7 +84,13 @@ def test_pattern_priority_fused_relu_first():
 
 
 def test_fuse_claims_relu_site():
-    mod = _apply_cutedsl_patterns(_linear_relu_module())
+    from tvm.relax.backend.cuda import cutedsl
+
+    cutedsl.set_dispatch_policy(min_static_m=256)  # M=512 test module
+    try:
+        mod = _apply_cutedsl_patterns(_linear_relu_module())
+    finally:
+        cutedsl.set_dispatch_policy(min_static_m=1024)
     txt = mod.script()
     assert 'Codegen": "cutedsl' in txt or "Codegen" in txt
     assert "cutedsl.matmul_transposed_relu" in txt
@@ -97,7 +103,6 @@ def test_fuse_claims_relu_site():
     [
         ({"n": BAD_N}, "n fails TMA alignment"),
         ({"dtype": "bfloat16"}, "kernel has no bf16"),
-        ({"extra_lead_dim": 4}, "rank-3 lhs not supported by v1 BYOC contract"),
     ],
 )
 def test_check_rejects(kwargs, reason):
@@ -105,9 +110,33 @@ def test_check_rejects(kwargs, reason):
     assert "cutedsl" not in mod["main"].script(), reason
 
 
-def test_byoc_e2e_numerics():
+def test_rank3_lhs_accepted():
+    """(B, S, K) activations are flattened to M = B*S by the kernel wrapper."""
+    mod = _apply_cutedsl_patterns(_linear_relu_module(extra_lead_dim=4))
+    assert "cutedsl.matmul_transposed_relu" in mod.script()
+
+
+def test_static_m_policy():
+    """Fully-static call-sites below min_static_m stay on cuBLAS/dlight
+    (decode-sized GEMMs lose on the persistent kernel); the threshold is
+    configurable via set_dispatch_policy."""
+    from tvm.relax.backend.cuda import cutedsl
+
+    small = _linear_relu_module()  # M x K with M = 512 (module constant)
+    cutedsl.set_dispatch_policy(min_static_m=1024)
+    try:
+        assert "cutedsl" not in _apply_cutedsl_patterns(small)["main"].script()
+        cutedsl.set_dispatch_policy(min_static_m=256)
+        assert "cutedsl" in _apply_cutedsl_patterns(small).script()
+    finally:
+        cutedsl.set_dispatch_policy(min_static_m=1024)  # restore default
+
+
+@pytest.mark.parametrize("lead", [None, 4], ids=["rank2", "rank3"])
+def test_byoc_e2e_numerics(lead):
     """Full pipeline: fuse -> RunCodegen (real kernel build, cached) ->
-    compile -> export (kernels linked in) -> load -> numerics vs numpy."""
+    compile -> export (kernels linked in) -> load -> numerics vs numpy.
+    rank3 exercises the (B, S, K) wrapper that flattens M = B*S."""
     torch = pytest.importorskip("torch")  # noqa: F841  (builder needs CUDA torch)
     pytest.importorskip("cutlass")
     if not tvm.cuda(0).exist:
@@ -115,10 +144,14 @@ def test_byoc_e2e_numerics():
 
     from tvm.relax.backend.cuda import cutedsl
 
-    mod = _linear_relu_module()
-    mod = _apply_cutedsl_patterns(mod)
-    mod = R.transform.RunCodegen()(mod)
-    assert "external_mods" in mod.attrs
+    cutedsl.set_dispatch_policy(min_static_m=256)  # M=512 test module
+    try:
+        mod = _linear_relu_module(extra_lead_dim=lead)
+        mod = _apply_cutedsl_patterns(mod)
+        mod = R.transform.RunCodegen()(mod)
+        assert "external_mods" in mod.attrs
+    finally:
+        cutedsl.set_dispatch_policy(min_static_m=1024)
 
     device = tvm.cuda(0)
     target = tvm.target.Target.from_device(device)
@@ -135,11 +168,14 @@ def test_byoc_e2e_numerics():
 
     vm = R.VirtualMachine(lib, device)
     rng = np.random.default_rng(0)
-    x = rng.standard_normal((M, K), np.float32).astype(np.float16)
+    x_shape = (M, K) if lead is None else (lead, M, K)
+    x = rng.standard_normal(x_shape, np.float32).astype(np.float16)
     w = rng.standard_normal((N, K), np.float32).astype(np.float16)
     out = vm["main"](tvm.runtime.tensor(x, device), tvm.runtime.tensor(w, device))
     got = out.numpy().astype(np.float32)
-    ref = np.maximum(x.astype(np.float32) @ w.astype(np.float32).T, 0.0)
+    ref = np.maximum(
+        x.astype(np.float32).reshape(-1, K) @ w.astype(np.float32).T, 0.0
+    ).reshape(got.shape)
     err = np.abs(got - ref).max() / np.abs(ref).max()
     assert err < 2e-3, f"scaled max-abs err {err:.2e}"
     assert (got >= 0).all(), "relu epilogue produced negatives"
