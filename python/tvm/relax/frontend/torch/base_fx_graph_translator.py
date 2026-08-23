@@ -1346,7 +1346,11 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         x = args[0]
         weight = args[1]
         bias = args[2] if len(args) > 2 else None
-        return self.block_builder.emit(relax.op.linear(x, weight, bias, "float32"))
+        # Match torch.nn.functional.linear semantics: the result dtype is the
+        # operands' dtype. Forcing out_dtype="float32" broke fp16/bf16 models
+        # (same bug as _addmm had); leaving it unset lets Relax infer the
+        # dtype from the inputs, which is unchanged for fp32.
+        return self.block_builder.emit(relax.op.linear(x, weight, bias, None))
 
     def _max_pool1d_impl(
         self,

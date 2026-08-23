@@ -1822,10 +1822,16 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "lt.Scalar": self._binary_op(relax.op.less, operator.lt),
             "lt.Tensor": self._binary_op(relax.op.less, operator.lt),
             "matmul.default": self._binary_op(
-                partial(relax.op.linear_algebra.matmul, out_dtype="float32"), operator.matmul
+                # dtype inferred from inputs (torch semantics) — forcing
+                # float32 broke fp16/bf16 models, same bug as _addmm had
+                relax.op.linear_algebra.matmul,
+                operator.matmul,
             ),
             "mm.default": self._binary_op(
-                partial(relax.op.linear_algebra.matmul, out_dtype="float32"), operator.matmul
+                # dtype inferred from inputs (torch semantics) — forcing
+                # float32 broke fp16/bf16 models, same bug as _addmm had
+                relax.op.linear_algebra.matmul,
+                operator.matmul,
             ),
             "max.other": self._binary_op(relax.op.maximum, max),
             "min.other": self._binary_op(relax.op.minimum, min),
@@ -1876,7 +1882,10 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "avg_pool3d.default": self._avg_pool3d,
             "baddbmm.default": self._baddbmm,
             "bmm.default": self._binary_op(
-                partial(relax.op.linear_algebra.matmul, out_dtype="float32"), operator.matmul
+                # dtype inferred from inputs (torch semantics) — forcing
+                # float32 broke fp16/bf16 models, same bug as _addmm had
+                relax.op.linear_algebra.matmul,
+                operator.matmul,
             ),
             "conv_transpose1d.default": self._conv_transpose1d,
             "conv_transpose2d.input": self._conv_transpose2d,
