@@ -749,7 +749,12 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
 
         res = None
         if alpha != 0:
-            res = self.block_builder.emit(relax.op.linear_algebra.matmul(y, z, out_dtype="float32"))
+            # Match torch.addmm semantics: the result dtype is the operands'
+            # dtype. Forcing out_dtype="float32" made the following
+            # add(bias, res) ill-typed for fp16/bf16 models (bias keeps the
+            # 16-bit dtype); leaving out_dtype unset lets Relax infer it
+            # from the inputs, which is unchanged for fp32.
+            res = self.block_builder.emit(relax.op.linear_algebra.matmul(y, z))
             if alpha != 1:
                 dtype = res.ty.dtype
                 res = self.block_builder.emit(relax.op.multiply(res, relax.const(alpha, dtype)))
