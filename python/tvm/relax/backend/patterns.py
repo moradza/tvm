@@ -404,14 +404,24 @@ def make_matmul_dequantize_pattern(
 
 def make_matmul_multiply_pattern(
     transposed_rhs: bool = False,
+    with_bias: bool = False,
+    activation: str | None = None,
 ) -> tuple[DFPattern, Mapping[str, DFPattern]]:
     """
-    Create pattern for matrix multiplication and multiply operation.
+    Create pattern for matrix multiplication and multiply operation,
+    optionally followed by a bias add and an activation.
 
     Parameters
     ----------
     transposed_rhs: bool
         Whether the right hand side of multiplication is transposed.
+
+    with_bias: bool
+        Whether to append a bias add after the scaling multiply.
+
+    activation: str | None
+        Name of the activation operator (e.g. "relax.nn.relu") applied after
+        the bias add, or None for no activation. Requires with_bias.
 
     Returns
     -------
@@ -436,6 +446,15 @@ def make_matmul_multiply_pattern(
     scale = is_op("relax.multiply")(scaleA.has_shape((1,)), scaleB.has_shape((1,)))
     out = is_op("relax.multiply")(out, scale)
     out = is_op("relax.astype")(out)
+
+    if with_bias:
+        bias = wildcard()
+        annotations["bias"] = bias
+        out = is_op("relax.add")(out, bias)
+
+    if activation:
+        assert with_bias, "activation requires with_bias (cuBLASLt *_BIAS epilogues)"
+        out = is_op(activation)(out)
 
     return out, annotations
 

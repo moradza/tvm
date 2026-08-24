@@ -64,18 +64,23 @@ class CublasJSONSerializer : public JSONSerializer {
       inputs_tmp.insert(inputs_tmp.end(), res.begin(), res.end());
     }
 
-    TVM_FFI_ICHECK(inputs_tmp.size() <= 4);
+    TVM_FFI_ICHECK(inputs_tmp.size() <= 5);
     NodeEntries inputs(inputs_tmp.size());
 
     auto arg_idx = backend::ExtractArgIdx(composite_name, fn);
     inputs[0] = inputs_tmp[arg_idx["lhs"]->value];
     inputs[1] = inputs_tmp[arg_idx["rhs"]->value];
-    if (inputs_tmp.size() == 3) {
-      inputs[2] = inputs_tmp[arg_idx["bias"]->value];
-    } else if (inputs_tmp.size() == 4) {
-      inputs[2] = inputs_tmp[arg_idx["scaleA"]->value];
-      inputs[3] = inputs_tmp[arg_idx["scaleB"]->value];
+    // Runtime input order: lhs, rhs, [bias], [scaleA, scaleB].
+    size_t idx = 2;
+    if (arg_idx.count("bias")) {
+      inputs[idx++] = inputs_tmp[arg_idx["bias"]->value];
     }
+    if (arg_idx.count("scaleA")) {
+      TVM_FFI_ICHECK(arg_idx.count("scaleB"));
+      inputs[idx++] = inputs_tmp[arg_idx["scaleA"]->value];
+      inputs[idx++] = inputs_tmp[arg_idx["scaleB"]->value];
+    }
+    TVM_FFI_ICHECK_EQ(idx, inputs_tmp.size());
 
     auto node = std::make_shared<JSONGraphNode>(composite_name, /* name_ */
                                                 "kernel",       /* op_type_ */

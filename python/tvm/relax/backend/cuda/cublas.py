@@ -216,6 +216,23 @@ register_patterns(
             *make_matmul_multiply_pattern(transposed_rhs=True),
             _check_matmul,
         ),
+        (
+            "cublas.matmul_transposed_multiply_bias",
+            *make_matmul_multiply_pattern(
+                transposed_rhs=True,
+                with_bias=True,
+            ),
+            _check_matmul,
+        ),
+        (
+            "cublas.matmul_transposed_multiply_bias_relu",
+            *make_matmul_multiply_pattern(
+                transposed_rhs=True,
+                with_bias=True,
+                activation="relax.nn.relu",
+            ),
+            _check_matmul,
+        ),
     ]
 )
 

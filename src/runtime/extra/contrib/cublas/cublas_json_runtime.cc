@@ -103,11 +103,14 @@ class CublasJSONRuntime : public JSONRuntimeBase {
 
     auto get_inputs = [=](const JSONGraphNode& node, bool has_bias, bool has_scale) {
       const DLTensor *bias = nullptr, *scaleA = nullptr, *scaleB = nullptr;
+      // Input order (fixed by the cublas codegen): lhs, rhs, [bias], [scaleA, scaleB].
+      int idx = 2;
       if (has_bias) {
-        bias = get_input(node, 2);
-      } else if (has_scale) {
-        scaleA = get_input(node, 2);
-        scaleB = get_input(node, 3);
+        bias = get_input(node, idx++);
+      }
+      if (has_scale) {
+        scaleA = get_input(node, idx++);
+        scaleB = get_input(node, idx++);
       }
       return std::make_tuple(get_input(node, 0), get_input(node, 1), bias, scaleA, scaleB);
     };
