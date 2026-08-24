@@ -122,11 +122,15 @@ def set_dispatch_policy(min_static_m: int = None, shapes=None, specializations=N
     specializations : dict, optional
         {(n, k): {"tile": [m, n], "cluster": [x, y], "swizzle": int}}
         MERGED over the built-in sweep-winner defaults.
-    auto_specialize : bool, optional
+    auto_specialize : bool or "measure", optional
         For shapes not in the table, pick tile/cluster/swizzle via
         nvMatmulHeuristics (cutedsl-aot/nvmmh_select.py) at codegen time.
-        Silently falls back to GemmSpec defaults when the optional
-        nvidia-matmul-heuristics package is absent. Default True.
+        True: heuristic top-1 (milliseconds). "measure": benchmark the
+        top-k candidates plus a small neighborhood ON SILICON and take the
+        measured winner (~1 min per new shape, content-cached builds) — a
+        heuristics-seeded mini-autotune. Silently falls back to GemmSpec
+        defaults when the optional nvidia-matmul-heuristics package is
+        absent. Default True.
     """
     if min_static_m is not None:
         _POLICY["min_static_m"] = int(min_static_m)
@@ -145,14 +149,17 @@ def _specialization_for(m, n, k, in_dtype, out_dtype):
     entry = _POLICY["specializations"].get((n, k))
     if entry is not None:
         return dict(entry)
-    if not _POLICY["auto_specialize"]:
+    mode = _POLICY["auto_specialize"]
+    if not mode:
         return {}
     try:
-        from nvmmh_select import select_spec  # cutedsl-aot root on sys.path
+        # cutedsl-aot root on sys.path
+        from nvmmh_select import select_spec, select_spec_measured
     except ImportError:
         return {}
     try:
-        return select_spec(m, n, k, in_dtype, out_dtype) or {}
+        picker = select_spec_measured if mode == "measure" else select_spec
+        return picker(m, n, k, in_dtype, out_dtype) or {}
     except Exception:  # pylint: disable=broad-except
         return {}  # heuristics are advisory; never fail the build over them
 
