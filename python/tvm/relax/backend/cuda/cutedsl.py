@@ -103,10 +103,12 @@ _DEFAULT_SPECIALIZATIONS = {
 }
 
 _POLICY = {"min_static_m": 1024, "shapes": None,
-           "specializations": dict(_DEFAULT_SPECIALIZATIONS)}
+           "specializations": dict(_DEFAULT_SPECIALIZATIONS),
+           "auto_specialize": True}
 
 
-def set_dispatch_policy(min_static_m: int = None, shapes=None, specializations=None):
+def set_dispatch_policy(min_static_m: int = None, shapes=None, specializations=None,
+                        auto_specialize: bool = None):
     """Configure which matmul call-sites the cutedsl patterns claim and how
     the kernels are specialized.
 
@@ -120,6 +122,11 @@ def set_dispatch_policy(min_static_m: int = None, shapes=None, specializations=N
     specializations : dict, optional
         {(n, k): {"tile": [m, n], "cluster": [x, y], "swizzle": int}}
         MERGED over the built-in sweep-winner defaults.
+    auto_specialize : bool, optional
+        For shapes not in the table, pick tile/cluster/swizzle via
+        nvMatmulHeuristics (cutedsl-aot/nvmmh_select.py) at codegen time.
+        Silently falls back to GemmSpec defaults when the optional
+        nvidia-matmul-heuristics package is absent. Default True.
     """
     if min_static_m is not None:
         _POLICY["min_static_m"] = int(min_static_m)
@@ -128,6 +135,26 @@ def set_dispatch_policy(min_static_m: int = None, shapes=None, specializations=N
         merged = dict(_DEFAULT_SPECIALIZATIONS)
         merged.update({tuple(map(int, k)): dict(v) for k, v in specializations.items()})
         _POLICY["specializations"] = merged
+    if auto_specialize is not None:
+        _POLICY["auto_specialize"] = bool(auto_specialize)
+
+
+def _specialization_for(m, n, k, in_dtype, out_dtype):
+    """Table entry, else (policy permitting) an nvMatmulHeuristics pick,
+    else {} (GemmSpec defaults)."""
+    entry = _POLICY["specializations"].get((n, k))
+    if entry is not None:
+        return dict(entry)
+    if not _POLICY["auto_specialize"]:
+        return {}
+    try:
+        from nvmmh_select import select_spec  # cutedsl-aot root on sys.path
+    except ImportError:
+        return {}
+    try:
+        return select_spec(m, n, k, in_dtype, out_dtype) or {}
+    except Exception:  # pylint: disable=broad-except
+        return {}  # heuristics are advisory; never fail the build over them
 
 
 def _check_matmul(context: PatternCheckContext) -> bool:
@@ -247,8 +274,6 @@ def _parse_codegen_function(fn) -> dict:
         "x_param": x_param,
         "w_param": w_param,
         "x_ndim": int(fn.params[x_param].ty.ndim),
-        # per-shape tile/cluster/swizzle from the policy table (may be {})
-        **_POLICY["specializations"].get((int(w_ty.shape[0]), int(w_ty.shape[1])), {}),
     }
 
 
@@ -263,6 +288,10 @@ def _cutedsl_codegen(functions, options, constant_names):  # pylint: disable=unu
     # any value works; override via RunCodegen target_options if desired:
     # RunCodegen({"cutedsl": {"sample_m": 4096}})
     sample_m = int(options["sample_m"]) if options and "sample_m" in options else 8192
+    for e in entries:
+        # per-shape tile/cluster/swizzle: policy table, else nvMMH heuristics
+        e.update(_specialization_for(sample_m, e["n"], e["k"],
+                                     e["in_dtype"], e["out_dtype"]))
     obj_path = ensure_library(
         str(home / "byoc_gemm_builder_cli.py"),
         {"sample_m": sample_m, "functions": entries},
