@@ -560,7 +560,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
         device_.device_type == DLDeviceType::kDLCPU) {
       aux_data_manager_ = std::make_unique<CachedPagedKVCacheAuxDataManager>(
           reserved_num_seqs, num_total_pages, prefill_chunk_size, dtype_aux_, device,
-          preferred_host_device, aux_stream, pinned_aux_mode_,
+          preferred_host_device, aux_stream, compute_stream_, pinned_aux_mode_,
           PinnedAuxConfig::Global()->slot_elems.load(std::memory_order_relaxed));
     } else {
       aux_data_manager_ = std::make_unique<PlainPagedKVCacheAuxDataManager>(
@@ -1246,6 +1246,9 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   }
 
   void EndForward() final {
+    // Ring-buffered aux managers record their slot fence here (all the
+    // step's kernels are enqueued by now).
+    aux_data_manager_->OnForwardEnd();
     if (kv_transfer_stream_ != nullptr) {
       DeviceAPI::Get(device_)->SyncStreamFromTo(device_, kv_transfer_stream_, compute_stream_);
     }

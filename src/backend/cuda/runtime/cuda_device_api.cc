@@ -269,6 +269,29 @@ class CUDADeviceAPI final : public DeviceAPI {
     TVM_FFI_CHECK_CUDA_ERROR(cudaEventDestroy(evt));
   }
 
+  TVMEventHandle CreateEvent(Device dev) final {
+    TVM_FFI_CHECK_CUDA_ERROR(cudaSetDevice(dev.device_id));
+    cudaEvent_t evt;
+    TVM_FFI_CHECK_CUDA_ERROR(cudaEventCreateWithFlags(&evt, cudaEventDisableTiming));
+    return static_cast<TVMEventHandle>(evt);
+  }
+
+  void FreeEvent(Device dev, TVMEventHandle event) final {
+    TVM_FFI_CHECK_CUDA_ERROR(cudaSetDevice(dev.device_id));
+    TVM_FFI_CHECK_CUDA_ERROR(cudaEventDestroy(static_cast<cudaEvent_t>(event)));
+  }
+
+  void EventRecord(Device dev, TVMEventHandle event, TVMStreamHandle stream) final {
+    TVM_FFI_CHECK_CUDA_ERROR(cudaSetDevice(dev.device_id));
+    TVM_FFI_CHECK_CUDA_ERROR(
+        cudaEventRecord(static_cast<cudaEvent_t>(event), static_cast<cudaStream_t>(stream)));
+  }
+
+  void EventSync(Device dev, TVMEventHandle event) final {
+    TVM_FFI_CHECK_CUDA_ERROR(cudaSetDevice(dev.device_id));
+    TVM_FFI_CHECK_CUDA_ERROR(cudaEventSynchronize(static_cast<cudaEvent_t>(event)));
+  }
+
   void StreamSync(Device dev, TVMStreamHandle stream) final {
     TVM_FFI_CHECK_CUDA_ERROR(cudaSetDevice(dev.device_id));
     TVM_FFI_CHECK_CUDA_ERROR(cudaStreamSynchronize(static_cast<cudaStream_t>(stream)));

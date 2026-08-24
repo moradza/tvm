@@ -37,6 +37,8 @@
  * can be NULL, which indicates the default one.
  */
 typedef void* TVMStreamHandle;
+/*! \brief The event handle type (opaque; device-specific). */
+typedef void* TVMEventHandle;
 
 namespace tvm {
 
@@ -247,6 +249,33 @@ class TVM_RUNTIME_DLL DeviceAPI {
    * \param event_dst The destination stream to synchronize.
    */
   virtual void SyncStreamFromTo(Device dev, TVMStreamHandle event_src, TVMStreamHandle event_dst);
+  /*!
+   * \brief Create a reusable event for host<->stream fencing.
+   * \param dev The device.
+   * \return The event handle, or nullptr when the device has no event
+   *         support (callers must degrade, e.g. to StreamSync).
+   */
+  virtual TVMEventHandle CreateEvent(Device dev);
+  /*!
+   * \brief Free an event created by CreateEvent.
+   * \param dev The device.
+   * \param event The event handle.
+   */
+  virtual void FreeEvent(Device dev, TVMEventHandle event);
+  /*!
+   * \brief Record the event at the current position of a stream.
+   * \param dev The device.
+   * \param event The event handle.
+   * \param stream The stream to record on.
+   */
+  virtual void EventRecord(Device dev, TVMEventHandle event, TVMStreamHandle stream);
+  /*!
+   * \brief Block the HOST until the event's last recorded position has
+   *        executed. Waiting on a never-recorded event returns immediately.
+   * \param dev The device.
+   * \param event The event handle.
+   */
+  virtual void EventSync(Device dev, TVMEventHandle event);
   /*!
    * \brief Allocate temporal workspace for backend execution.
    *

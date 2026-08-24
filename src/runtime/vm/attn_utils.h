@@ -27,6 +27,7 @@
 #include <tvm/ffi/container/map.h>
 #include <tvm/ffi/container/shape.h>
 #include <tvm/runtime/logging.h>
+#include <tvm/runtime/device_api.h>
 #include <tvm/runtime/tensor.h>
 #include <tvm/support/cuda/nvtx.h>
 
@@ -537,6 +538,11 @@ class PagedKVCacheAuxDataManager {
                                                      HostMemoryVector* dst_data) = 0;
   /*! \brief Commit all the compact KV auxiliary data copy operations since the last commit. */
   virtual void CommitCompactKVAuxDataCopy() = 0;
+  /*!
+   * \brief Called at EndForward, after the step's kernels are enqueued.
+   * Ring-buffered managers record their slot fence here.
+   */
+  virtual void OnForwardEnd() {}
 
  protected:
   /*! \brief The dtype of the auxiliary data. It is expected to be int32. */
@@ -814,37 +820,69 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
   explicit CachedPagedKVCacheAuxDataManager(int64_t reserved_num_seqs, int64_t num_total_pages,
                                             int64_t prefill_chunk_size, DLDataType dtype_aux,
                                             Device device, Device preferred_host_device,
-                                            TVMStreamHandle copy_stream, bool pinned_aux = false,
+                                            TVMStreamHandle copy_stream,
+                                            TVMStreamHandle fence_stream = nullptr,
+                                            bool pinned_aux = false,
                                             int64_t pinned_slot_elems = 4096)
       : PagedKVCacheAuxDataManager(dtype_aux, device, preferred_host_device, copy_stream),
         elem_byte_size_((dtype_aux.bits * dtype_aux.lanes + 7) / 8),
         offset_alignment_(cuda_byte_alignment_ / elem_byte_size_),
         pinned_(pinned_aux),
-        pinned_slot_elems_(pinned_slot_elems) {
-    // - Calculate cache size of all the attention auxiliary arrays in
-    // local cache and the large on-device array.
-    // int64_t attn_aux_data_cache_size =
-    //     CalculateAttnAuxDataCacheSize(reserved_num_seqs, num_total_pages, prefill_chunk_size);
-    int64_t attn_aux_data_cache_size = 32 * 1024 * 1024;
+        pinned_slot_elems_(pinned_slot_elems),
+        fence_stream_(fence_stream),
+        ring_depth_(pinned_aux ? 1 : kAuxRingDepth) {
+    // Ring-buffered aux staging: the merged buffers are rotated over
+    // ring_depth_ slots and slot reuse is fenced on the COMPUTE stream
+    // (OnForwardEnd/ResetAttnAuxDataCopy), so a host that runs ahead of the
+    // compute backlog can never overwrite aux content that in-flight
+    // kernels still read (single-buffered staging raced: see
+    // docs/CONFIG.md "aux-upload race" in the tvm-dev repo). Pinned mode
+    // needs STABLE addresses for CUDA-graph replay and is already ordered
+    // by same-stream uploads, so it keeps a single unfenced slot.
+    // Sizing: the calculated per-step requirement (audited against
+    // SyncAuxArrayToDevice) with a 2x safety factor; overflow is ICHECKed
+    // at copy time.
+    int64_t attn_aux_data_cache_size =
+        2 * CalculateAttnAuxDataCacheSize(reserved_num_seqs, num_total_pages, prefill_chunk_size);
     attn_aux_arena_elems_ = attn_aux_data_cache_size;
-    // - Initialize the host auxiliary data buffer.
-    merged_attn_aux_data_host_ =
-        HostMemoryVector(attn_aux_data_cache_size, dtype_aux, preferred_host_device);
-    // - Initialize the device auxiliary data buffer.
-    merged_attn_aux_data_device_ = Tensor::Empty({attn_aux_data_cache_size}, dtype_aux, device);
-
-    // - Calculate cache size of all the compact KV auxiliary arrays in
-    // local cache and the large on-device array.
     int64_t compact_kv_aux_data_cache_size =
-        CalculateCompactKVAuxDataCacheSize(reserved_num_seqs, prefill_chunk_size);
-    // - Initialize the host auxiliary data buffer.
-    merged_compact_kv_aux_data_host_ =
-        HostMemoryVector(compact_kv_aux_data_cache_size, dtype_aux, preferred_host_device);
-    merged_compact_kv_aux_data_device_ =
-        Tensor::Empty({compact_kv_aux_data_cache_size}, dtype_aux, device);
+        2 * CalculateCompactKVAuxDataCacheSize(reserved_num_seqs, prefill_chunk_size);
+    for (int i = 0; i < ring_depth_; ++i) {
+      attn_host_ring_.push_back(
+          HostMemoryVector(attn_aux_data_cache_size, dtype_aux, preferred_host_device));
+      attn_device_ring_.push_back(Tensor::Empty({attn_aux_data_cache_size}, dtype_aux, device));
+      compact_host_ring_.push_back(
+          HostMemoryVector(compact_kv_aux_data_cache_size, dtype_aux, preferred_host_device));
+      compact_device_ring_.push_back(
+          Tensor::Empty({compact_kv_aux_data_cache_size}, dtype_aux, device));
+      fences_.push_back(pinned_ ? nullptr : DeviceAPI::Get(device)->CreateEvent(device));
+    }
   }
 
-  void ResetAttnAuxDataCopy() final { attn_aux_data_copy_offset_ = 0; }
+  ~CachedPagedKVCacheAuxDataManager() {
+    for (TVMEventHandle fence : fences_) {
+      if (fence != nullptr) {
+        DeviceAPI::Get(device_)->FreeEvent(device_, fence);
+      }
+    }
+  }
+
+  void ResetAttnAuxDataCopy() final {
+    if (!pinned_) {
+      attn_ring_pos_ = (attn_ring_pos_ + 1) % ring_depth_;
+      // Wait until the step that last used this slot has fully executed on
+      // the compute stream (a never-recorded event completes immediately).
+      // Without event support, degrade to a full compute-stream sync.
+      if (fences_[attn_ring_pos_] != nullptr) {
+        DeviceAPI::Get(device_)->EventSync(device_, fences_[attn_ring_pos_]);
+      } else if (device_.device_type != kDLCPU) {
+        // no event support: degrade to a full sync of the fence stream
+        // (nullptr = the device's default stream)
+        DeviceAPI::Get(device_)->StreamSync(device_, fence_stream_);
+      }
+    }
+    attn_aux_data_copy_offset_ = 0;
+  }
   Tensor CopyQOIndptrOnDepthAsync(HostMemoryVector* data, int depth) final {
     return CopyAttnAuxVecToCache(data, "CopyQOIndptrOnDepthAsync", depth);
   }
@@ -901,14 +939,14 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
       offset = PinnedOffsetFor(std::string("CopyLengthInfoOnDepthAsync/") + std::to_string(depth),
                                3 * n_elem);
     }
-    std::memcpy(merged_attn_aux_data_host_.data() + offset, last_page_len->data(),
+    std::memcpy(attn_host_ring_[attn_ring_pos_].data() + offset, last_page_len->data(),
                 n_elem * elem_byte_size_);
-    std::memcpy(merged_attn_aux_data_host_.data() + offset + n_elem, sliding_window_offset->data(),
+    std::memcpy(attn_host_ring_[attn_ring_pos_].data() + offset + n_elem, sliding_window_offset->data(),
                 n_elem * elem_byte_size_);
-    std::memcpy(merged_attn_aux_data_host_.data() + offset + 2 * n_elem, sink_size->data(),
+    std::memcpy(attn_host_ring_[attn_ring_pos_].data() + offset + 2 * n_elem, sink_size->data(),
                 n_elem * elem_byte_size_);
     Tensor view =
-        merged_attn_aux_data_device_.CreateView({3, n_elem}, dtype_aux_, offset * elem_byte_size_);
+        attn_device_ring_[attn_ring_pos_].CreateView({3, n_elem}, dtype_aux_, offset * elem_byte_size_);
     if (!pinned_) {
       attn_aux_data_copy_offset_ += CeilDivElemAlignment(3 * n_elem);
     }
@@ -920,7 +958,7 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
         pinned_ ? std::max(pinned_high_water_, attn_aux_data_copy_offset_)
                 : attn_aux_data_copy_offset_};
     DLTensor copy_dst;
-    copy_dst.data = merged_attn_aux_data_device_->data;
+    copy_dst.data = attn_device_ring_[attn_ring_pos_]->data;
     copy_dst.device = device_;
     copy_dst.ndim = 1;
     copy_dst.dtype = dtype_aux_;
@@ -929,12 +967,23 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
     copy_dst.byte_offset = 0;
 
     DLTensor copy_src = copy_dst;
-    copy_src.data = merged_attn_aux_data_host_.data();
+    copy_src.data = attn_host_ring_[attn_ring_pos_].data();
     copy_src.device = Device{kDLCPU, 0};
     Tensor::CopyFromTo(&copy_src, &copy_dst, copy_stream_);
   }
 
   void ResetCompactKVAuxDataCopy() final { compact_kv_aux_data_copy_offset_ = 0; }
+
+  void OnForwardEnd() final {
+    // Record this slot's fence after the step's kernels were enqueued on
+    // the compute stream; ResetAttnAuxDataCopy waits on it before reuse.
+    // NOTE: fence_stream_ == nullptr is the LEGACY DEFAULT stream — a valid
+    // stream to record on, not an absent one (guarding on it disables
+    // fencing entirely for default-stream pipelines).
+    if (!pinned_ && fences_[attn_ring_pos_] != nullptr) {
+      DeviceAPI::Get(device_)->EventRecord(device_, fences_[attn_ring_pos_], fence_stream_);
+    }
+  }
 
   Tensor CopyCommitLengthIndptrAsync(HostMemoryVector* data) final {
     return CopyCompactKVAuxVecToCache(data);
@@ -942,11 +991,11 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
   Tensor CopyCommitSrcDstPosInPageTableAsync(HostMemoryVector* src_data,
                                              HostMemoryVector* dst_data) final {
     int64_t n_elem = src_data->size();
-    std::memcpy(merged_compact_kv_aux_data_host_.data() + compact_kv_aux_data_copy_offset_,
+    std::memcpy(compact_host_ring_[attn_ring_pos_].data() + compact_kv_aux_data_copy_offset_,
                 src_data->data(), n_elem * elem_byte_size_);
-    std::memcpy(merged_compact_kv_aux_data_host_.data() + compact_kv_aux_data_copy_offset_ + n_elem,
+    std::memcpy(compact_host_ring_[attn_ring_pos_].data() + compact_kv_aux_data_copy_offset_ + n_elem,
                 dst_data->data(), n_elem * elem_byte_size_);
-    Tensor view = merged_compact_kv_aux_data_device_.CreateView(
+    Tensor view = compact_device_ring_[attn_ring_pos_].CreateView(
         {2, n_elem}, dtype_aux_, compact_kv_aux_data_copy_offset_ * elem_byte_size_);
     compact_kv_aux_data_copy_offset_ += CeilDivElemAlignment(2 * n_elem);
     return view;
@@ -955,7 +1004,7 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
   void CommitCompactKVAuxDataCopy() final {
     std::vector<int64_t> copy_shape{compact_kv_aux_data_copy_offset_};
     DLTensor copy_dst;
-    copy_dst.data = merged_compact_kv_aux_data_device_->data;
+    copy_dst.data = compact_device_ring_[attn_ring_pos_]->data;
     copy_dst.device = device_;
     copy_dst.ndim = 1;
     copy_dst.dtype = dtype_aux_;
@@ -964,7 +1013,7 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
     copy_dst.byte_offset = 0;
 
     DLTensor copy_src = copy_dst;
-    copy_src.data = merged_compact_kv_aux_data_host_.data();
+    copy_src.data = compact_host_ring_[attn_ring_pos_].data();
     copy_src.device = Device{kDLCPU, 0};
     Tensor::CopyFromTo(&copy_src, &copy_dst, copy_stream_);
   }
@@ -1067,10 +1116,12 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
     if (pinned_ && key != nullptr) {
       offset = PinnedOffsetFor(std::string(key) + "/" + std::to_string(depth), n_elem);
     }
-    std::memcpy(merged_attn_aux_data_host_.data() + offset, data->data(),
+    TVM_FFI_ICHECK_LE(offset + n_elem, attn_aux_arena_elems_)
+        << "merged attn aux staging overflow (CalculateAttnAuxDataCacheSize undersized?)";
+    std::memcpy(attn_host_ring_[attn_ring_pos_].data() + offset, data->data(),
                 n_elem * elem_byte_size_);
     Tensor view =
-        merged_attn_aux_data_device_.CreateView({n_elem}, dtype_aux_, offset * elem_byte_size_);
+        attn_device_ring_[attn_ring_pos_].CreateView({n_elem}, dtype_aux_, offset * elem_byte_size_);
     if (!(pinned_ && key != nullptr)) {
       attn_aux_data_copy_offset_ += CeilDivElemAlignment(n_elem);
     }
@@ -1079,9 +1130,9 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
 
   Tensor CopyCompactKVAuxVecToCache(HostMemoryVector* data) {
     int64_t n_elem = data->size();
-    std::memcpy(merged_compact_kv_aux_data_host_.data() + compact_kv_aux_data_copy_offset_,
+    std::memcpy(compact_host_ring_[attn_ring_pos_].data() + compact_kv_aux_data_copy_offset_,
                 data->data(), n_elem * elem_byte_size_);
-    Tensor view = merged_compact_kv_aux_data_device_.CreateView(
+    Tensor view = compact_device_ring_[attn_ring_pos_].CreateView(
         {n_elem}, dtype_aux_, compact_kv_aux_data_copy_offset_ * elem_byte_size_);
     compact_kv_aux_data_copy_offset_ += CeilDivElemAlignment(n_elem);
     return view;
@@ -1112,10 +1163,16 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
   int64_t pinned_high_water_ = 0;
   int64_t attn_aux_arena_elems_ = 0;
   int64_t compact_kv_aux_data_copy_offset_ = 0;
-  HostMemoryVector merged_attn_aux_data_host_;
-  HostMemoryVector merged_compact_kv_aux_data_host_;
-  Tensor merged_attn_aux_data_device_;
-  Tensor merged_compact_kv_aux_data_device_;
+  // Ring-buffered merged staging (slot reuse fenced; see ctor comment).
+  static constexpr int kAuxRingDepth = 4;
+  const TVMStreamHandle fence_stream_;  // compute stream: fences recorded here
+  const int ring_depth_;
+  size_t attn_ring_pos_ = 0;
+  std::vector<HostMemoryVector> attn_host_ring_;
+  std::vector<HostMemoryVector> compact_host_ring_;
+  std::vector<Tensor> attn_device_ring_;
+  std::vector<Tensor> compact_device_ring_;
+  std::vector<TVMEventHandle> fences_;
 };
 
 }  // namespace vm
